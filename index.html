@@ -463,8 +463,9 @@
     }
 
     // ── Tasks View ────────────────────────────────────────────────────────────
-    function TasksView({ tasks, filter, setFilter, names, onToggle, onDelete }) {
+    function TasksView({ tasks, filter, setFilter, names, onToggle, onDelete, onUpdate }) {
       const asgn = getAsgn(names);
+      const [expandedId, setExpandedId] = useState(null);
       const counts = {
         wife:     tasks.filter(t => !t.done && t.assignee === 'wife').length,
         husband:  tasks.filter(t => !t.done && t.assignee === 'husband').length,
@@ -505,24 +506,60 @@
           ) : filtered.map(t => {
             const cat = CATS[t.category] || CATS.other;
             const ac  = asgn[t.assignee] || asgn.wife;
+            const isExpanded = expandedId === t.id;
             return (
-              <div key={t.id} className={`bg-white rounded-2xl p-4 mb-2.5 shadow-sm border border-stone-100 flex gap-3 items-start ${t.done ? 'opacity-50' : ''}`}>
-                <div onClick={() => onToggle(t.id)}
-                  className={`mt-0.5 w-5 h-5 rounded-md border-2 flex-shrink-0 flex items-center justify-center cursor-pointer transition-colors ${t.done ? 'bg-green-600 border-green-600' : 'border-stone-300'}`}>
-                  {t.done && <span className="text-white text-xs">✓</span>}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className={`text-sm font-medium text-stone-800 mb-1.5 ${t.done ? 'line-through' : ''}`}>{t.title}</p>
-                  <div className="flex flex-wrap gap-1.5 items-center">
-                    <Chip tw={cat.tw}>{cat.icon} {cat.label}</Chip>
-                    <Chip tw={ac.tw}>{ac.label}</Chip>
-                    {t.ruleApplied && <span className="text-xs text-stone-300" title="Rule applied">🔒</span>}
-                    {t.priority === 'high' && <Chip tw="bg-red-100 text-red-700">↑ High</Chip>}
-                    {t.estimatedMinutes > 0 && <Chip tw="bg-stone-100 text-stone-500">~{t.estimatedMinutes}m</Chip>}
-                    {t.capturedBy && <Chip tw="bg-stone-50 text-stone-400">via {asgn[t.capturedBy]?.label || t.capturedBy}</Chip>}
+              <div key={t.id} className={`bg-white rounded-2xl mb-2.5 shadow-sm border border-stone-100 overflow-hidden ${t.done ? 'opacity-50' : ''}`}>
+                {/* Main row */}
+                <div className="flex gap-3 items-start p-4">
+                  <div onClick={() => onToggle(t.id)}
+                    className={`mt-0.5 w-5 h-5 rounded-md border-2 flex-shrink-0 flex items-center justify-center cursor-pointer transition-colors ${t.done ? 'bg-green-600 border-green-600' : 'border-stone-300'}`}>
+                    {t.done && <span className="text-white text-xs">✓</span>}
                   </div>
+                  <div className="flex-1 min-w-0" onClick={() => !t.done && setExpandedId(isExpanded ? null : t.id)} style={{cursor: t.done ? 'default' : 'pointer'}}>
+                    <p className={`text-sm font-medium text-stone-800 mb-1.5 ${t.done ? 'line-through' : ''}`}>{t.title}</p>
+                    <div className="flex flex-wrap gap-1.5 items-center">
+                      <Chip tw={cat.tw}>{cat.icon} {cat.label}</Chip>
+                      <Chip tw={ac.tw}>{ac.label}</Chip>
+                      {t.priority === 'high' && <Chip tw="bg-red-100 text-red-700">↑ High</Chip>}
+                      {t.estimatedMinutes > 0 && <Chip tw="bg-stone-100 text-stone-500">~{t.estimatedMinutes}m</Chip>}
+                      {!t.done && <span className="text-xs text-stone-300">{isExpanded ? '▲ less' : '✏️ edit'}</span>}
+                    </div>
+                  </div>
+                  <button onClick={() => onDelete(t.id)} className="text-stone-300 hover:text-red-400 text-xl leading-none transition-colors flex-shrink-0">×</button>
                 </div>
-                <button onClick={() => onDelete(t.id)} className="text-stone-300 hover:text-red-400 text-xl leading-none transition-colors">×</button>
+
+                {/* Expanded edit panel */}
+                {isExpanded && !t.done && (
+                  <div className="border-t border-stone-50 px-4 pb-4 pt-3 bg-stone-50">
+                    {/* Owner */}
+                    <div className="mb-3">
+                      <p className="text-xs font-semibold text-stone-400 mb-2 uppercase tracking-wide">Assigned to</p>
+                      <div className="flex gap-2">
+                        {['wife', 'husband', 'together'].map(a => {
+                          const cfg = asgn[a];
+                          return (
+                            <button key={a} onClick={() => onUpdate(t.id, { assignee: a, ruleApplied: false })}
+                              className={`flex-1 text-xs font-semibold py-2 rounded-xl transition-colors ${t.assignee === a ? cfg.btn + ' text-white' : 'bg-white text-stone-400 border border-stone-200 hover:border-stone-300'}`}>
+                              {cfg.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                    {/* Category */}
+                    <div>
+                      <p className="text-xs font-semibold text-stone-400 mb-2 uppercase tracking-wide">Category</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {Object.entries(CATS).map(([key, c]) => (
+                          <button key={key} onClick={() => onUpdate(t.id, { category: key })}
+                            className={`text-xs px-2.5 py-1.5 rounded-lg font-medium transition-colors ${t.category === key ? 'ring-2 ring-orange-400 ' + c.tw : 'bg-white text-stone-400 border border-stone-200 hover:border-stone-300'}`}>
+                            {c.icon} {c.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
             );
           })}
@@ -777,7 +814,23 @@
         try {
           const raw = await callAI(
             apiKey,
-            `Extract household tasks from a voice/text note. Captured by "${names[profile] || profile}". Category rules (MUST follow): ${ruledCats || 'none — suggest fair 50/50 split'}. Return ONLY a JSON array, no markdown. Each item: {"title":string,"category":"kitchen"|"cleaning"|"groceries"|"finances"|"maintenance"|"laundry"|"selfcare"|"social"|"other","priority":"high"|"medium"|"low","assignee":"wife"|"husband"|"together","estimatedMinutes":number}`,
+            `You are a household task extractor. Extract every task from the note and return ONLY a valid JSON array, no markdown, no explanation.
+
+Category guide — use the MOST SPECIFIC match, never default to "other" unless truly uncategorizable:
+- kitchen: cooking, dishes, utensils, oven, fridge, food prep, meals
+- cleaning: sweeping, mopping, dusting, vacuum, bathroom, toilet, surfaces, tidying, declutter
+- groceries: buying food/vegetables/milk/bread, supermarket, BigBasket, Zepto, Blinkit, sabzi, ration, household supplies
+- finances: bills, rent, electricity, internet, insurance, bank, taxes, payments, EMI, recharge, mobile bill, gas bill
+- maintenance: repairs, plumber, electrician, carpenter, fix, broken, AC, appliances, painting, pest control
+- laundry: washing clothes, drying, ironing, folding, dry cleaning, kapde
+- selfcare: doctor, medicine, gym, haircut, salon, health, appointment, dentist, hospital, chemist
+- social: events, parties, gifts, calls, family, friends, travel, vacation, wedding, pooja, ceremony
+- other: ONLY use this if the task genuinely does not fit ANY category above
+
+Category rules to follow: ${ruledCats || 'none'}.
+Assignee rules: for categories without rules, suggest a fair split — do NOT assign everything to one person.
+
+Each JSON item: {"title":string,"category":"kitchen"|"cleaning"|"groceries"|"finances"|"maintenance"|"laundry"|"selfcare"|"social"|"other","priority":"high"|"medium"|"low","assignee":"wife"|"husband"|"together","estimatedMinutes":number}`,
             `Note: "${text}"`
           );
           const parsed = JSON.parse(raw.replace(/```json|```/g, '').trim());
@@ -889,7 +942,7 @@
 
           <main className="px-4 pt-4">
             {view === 'capture'  && <CaptureView profile={profile} names={names} rules={rules} isListening={isListening} live={live} saved={saved} pending={pending} setPending={setPending} processing={processing} procErr={procErr} speechOk={speechOk} txt={txt} setTxt={setTxt} onStart={startListening} onStop={() => recRef.current?.stop()} onAdd={addPending} onSubmitText={async () => { if (!txt.trim()) return; setSaved(txt); await processNote(txt); }} />}
-            {view === 'tasks'    && <TasksView tasks={tasks} filter={filter} setFilter={setFilter} names={names} onToggle={id => setTasks(p => p.map(t => t.id === id ? { ...t, done: !t.done } : t))} onDelete={id => setTasks(p => p.filter(t => t.id !== id))} />}
+            {view === 'tasks'    && <TasksView tasks={tasks} filter={filter} setFilter={setFilter} names={names} onToggle={id => setTasks(p => p.map(t => t.id === id ? { ...t, done: !t.done } : t))} onDelete={id => setTasks(p => p.filter(t => t.id !== id))} onUpdate={(id, changes) => setTasks(p => p.map(t => t.id === id ? { ...t, ...changes } : t))} />}
             {view === 'plan'     && <PlanView plan={plan} loading={planLoading} planErr={planErr} names={names} onGenerate={generatePlan} pendingCount={pendingCount} />}
             {view === 'assist'   && <AssistView msgs={chatMsgs} input={chatInput} setInput={setChatInput} onSend={sendChat} loading={chatLoading} endRef={endRef} />}
             {view === 'settings' && <SettingsView names={names} setNames={n => { setNames(n); Store.set('names', n); }} rules={rules} setRules={r => { setRules(r); Store.set('rules', r); }} fbConnected={fbConn} apiKey={apiKey} onResetKey={() => { localStorage.clear(); window.location.reload(); }} />}

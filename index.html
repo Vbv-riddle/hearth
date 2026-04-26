@@ -31,9 +31,14 @@
   <script type="text/babel">
     const { useState, useEffect, useRef } = React;
 
-    // ── MODEL — must use the public Anthropic API model string ────────────────
-    // NOTE: Do NOT use 'claude-sonnet-4-20250514' — that only works inside Claude.ai
-    const AI_MODEL = 'claude-3-haiku-20240307';
+    // ── MODEL — auto-detects first available model on this API key ──────────────
+    const MODELS_TO_TRY = [
+      'claude-3-5-haiku-20241022',
+      'claude-3-haiku-20240307',
+      'claude-3-5-sonnet-20241022',
+      'claude-3-sonnet-20240229',
+    ];
+    let AI_MODEL = MODELS_TO_TRY[0]; // will be updated after detection
 
     // ── Firebase / localStorage store ─────────────────────────────────────────
     let _db = null;
@@ -69,7 +74,7 @@
     };
 
     // ── AI call ───────────────────────────────────────────────────────────────
-    const callAI = async (apiKey, system, msgs) => {
+    const makeRequest = async (apiKey, model, system, msgs) => {
       const res = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
@@ -79,16 +84,35 @@
           'anthropic-dangerous-direct-browser-access': 'true'
         },
         body: JSON.stringify({
-          model: AI_MODEL,
+          model,
           max_tokens: 1500,
           system,
           messages: Array.isArray(msgs) ? msgs : [{ role: 'user', content: msgs }]
         })
       });
       const d = await res.json();
-      if (d.error) throw new Error(d.error.message || JSON.stringify(d.error));
-      if (!d.content?.[0]?.text) throw new Error('Empty response from API');
+      if (d.error) throw new Error(`[${d.error.type||'error'}] ${d.error.message || JSON.stringify(d.error)}`);
+      if (!d.content?.[0]?.text) throw new Error('Empty response: ' + JSON.stringify(d));
       return d.content[0].text;
+    };
+
+    const callAI = async (apiKey, system, msgs) => {
+      // Try each model in order until one works
+      let lastErr = null;
+      for (const model of MODELS_TO_TRY) {
+        try {
+          const result = await makeRequest(apiKey, model, system, msgs);
+          AI_MODEL = model; // remember working model for subsequent calls
+          return result;
+        } catch(e) {
+          lastErr = e;
+          // Only keep trying if it's a model-not-found error
+          const msg = e.message || '';
+          const isModelErr = msg.includes('model:') || msg.includes('not_found') || msg.includes('does not exist');
+          if (!isModelErr) throw e; // auth error, quota, etc — stop immediately
+        }
+      }
+      throw new Error('No working model found. Last error: ' + (lastErr?.message || 'unknown'));
     };
 
     // ── Constants ─────────────────────────────────────────────────────────────
@@ -227,10 +251,11 @@
       const testKey = async () => {
         setTesting(true); setTestMsg(''); setTestOk(null);
         try {
-          await callAI(apiKey, 'You are a test.', 'Reply with just the word OK');
-          setTestOk(true); setTestMsg('✅ API key is working!');
+          const reply = await callAI(apiKey, 'You are a test assistant.', 'Reply with just the word OK');
+          setTestOk(true); setTestMsg('✅ Working! Model: ' + AI_MODEL + '. Response: ' + reply.trim());
         } catch(e) {
-          setTestOk(false); setTestMsg('❌ ' + e.message);
+          setTestOk(false);
+          setTestMsg('❌ Full error: ' + e.message + '\n\nIf you see "authentication_error" — your API key is wrong or expired. Get a new one at console.anthropic.com → API Keys.');
         }
         setTesting(false);
       };

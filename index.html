@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hearth 🏡</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+  <style>
+    @keyframes micPulse {
+      0%   { box-shadow: 0 0 0 0 rgba(220,38,38,0.6), 0 8px 24px rgba(234,88,12,0.4); }
+      70%  { box-shadow: 0 0 0 18px rgba(220,38,38,0), 0 8px 24px rgba(234,88,12,0.4); }
+      100% { box-shadow: 0 0 0 0 rgba(220,38,38,0),   0 8px 24px rgba(234,88,12,0.4); }
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .mic-pulse { animation: micPulse 1.5s ease-out infinite; }
+    .spinner { animation: spin 0.8s linear infinite; }
+    input:focus, textarea:focus { outline: none; border-color: #ea580c !important; }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 4px; }
+  </style>
+</head>
+<body class="bg-orange-50 font-sans">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // ─── Storage (Firebase if configured, else localStorage) ─────────────────
+    let _db = null;
+    const Store = {
+      init(cfg) {
+        try {
+          if (!cfg?.databaseURL) return false;
+          if (!firebase.apps.length) firebase.initializeApp(cfg);
+          _db = firebase.database();
+          return true;
+        } catch(e) { console.warn('Firebase init failed', e); return false; }
+      },
+      set(path, val) {
+        if (_db) return _db.ref('hearth/' + path).set(val);
+        localStorage.setItem('h-' + path, JSON.stringify(val));
+        return Promise.resolve();
+      },
+      async get(path) {
+        if (_db) {
+          const s = await _db.ref('hearth/' + path).get();
+          return s.exists() ? s.val() : null;
+        }
+        try { return JSON.parse(localStorage.getItem('h-' + path)); } catch { return null; }
+      },
+      listen(path, cb) {
+        if (_db) {
+          const r = _db.ref('hearth/' + path);
+          r.on('value', s => cb(s.val()));
+          return () => r.off('value');
+        }
+        return () => {};
+      }
+    };
+
+    // ─── AI call ─────────────────────────────────────────────────────────────
+    const callAI = async (apiKey, system, msgs) => {
+      const r = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'anthropic-dangerous-direct-browser-access': 'true' },
+        body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1500, system, messages: Array.isArray(msgs) ? msgs : [{ role:'user', content: msgs }] })
+      });
+      const d = await r.json();
+      if (d.error) throw new Error(d.error.message);
+      return d.content[0].text;
+    };
+
+    // ─── Constants ────────────────────────────────────────────────────────────
+    const CATS = {
+      kitchen:     { label:'Kitchen',   icon:'🍳', tw:'bg-orange-100 text-orange-800' },
+      cleaning:    { label:'Cleaning',  icon:'🧹', tw:'bg-emerald-100 text-emerald-800' },
+      groceries:   { label:'Groceries', icon:'🛒', tw:'bg-violet-100 text-violet-800' },
+      finances:    { label:'Finances',  icon:'💰', tw:'bg-yellow-100 text-yellow-800' },
+      maintenance: { label:'Repairs',   icon:'🔧', tw:'bg-slate-100 text-slate-700' },
+      laundry:     { label:'Laundry',   icon:'👕', tw:'bg-sky-100 text-sky-800' },
+      selfcare:    { label:'Self-care', icon:'🌿', tw:'bg-teal-100 text-teal-800' },
+      social:      { label:'Social',    icon:'🎉', tw:'bg-pink-100 text-pink-800' },
+      other:       { label:'Other',     icon:'📝', tw:'bg-stone-100 text-stone-700' },
+    };
+    const getAsgn = (n) => ({
+      wife:    { label: n.wife    || 'Wife',    tw:'bg-orange-100 text-orange-800', btn:'bg-orange-600' },
+      husband: { label: n.husband || 'Husband', tw:'bg-blue-100 text-blue-800',    btn:'bg-blue-600'   },
+      together:{ label: 'Together',             tw:'bg-green-100 text-green-800',  btn:'bg-green-600'  },
+    });
+    const applyRules = (tasks, rules) =>
+      tasks.map(t => { const r = rules[t.category]; return r ? {...t, assignee:r, ruleApplied:true} : {...t, ruleApplied:false}; });
+
+    const Chip = ({tw,children}) => <span className={`text-xs font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${tw}`}>{children}</span>;
+    const Spin = () => <div className="spinner w-4 h-4 rounded-full border-2 border-orange-200 border-t-orange-600 flex-shrink-0" />;
+
+    // ─── Setup Screen ─────────────────────────────────────────────────────────
+    function SetupScreen({ onDone }) {
+      const [apiKey, setApiKey] = useState('');
+      const [fbRaw, setFbRaw]   = useState('');
+      const [err, setErr]       = useState('');
+      const [step, setStep]     = useState(1);
+
+      const finish = () => {
+        if (!apiKey.trim()) { setErr('Anthropic API key is required.'); return; }
+        let fbCfg = null;
+        if (fbRaw.trim()) {
+          try {
+            const cleaned = fbRaw.trim().replace(/^const\s+\w+\s*=\s*/, '').replace(/;$/, '');
+            fbCfg = JSON.parse(cleaned);
+          } catch { setErr('Firebase config looks invalid. Paste the full JSON object from Firebase console.'); return; }
+        }
+        localStorage.setItem('hearth-apikey', apiKey.trim());
+        if (fbCfg) localStorage.setItem('hearth-fbcfg', JSON.stringify(fbCfg));
+        onDone(apiKey.trim(), fbCfg);
+      };
+
+      return (
+        <div className="min-h-screen bg-orange-50 flex items-start justify-center px-4 pt-10 pb-8">
+          <div style={{maxWidth:460, width:'100%'}}>
+            <div className="text-center mb-8">
+              <div className="text-5xl mb-3">🏡</div>
+              <h1 className="text-2xl font-bold text-orange-700" style={{fontFamily:'Georgia,serif'}}>Welcome to Hearth</h1>
+              <p className="text-sm text-stone-500 mt-2 leading-relaxed">Your shared household hub. Quick one-time setup.</p>
+            </div>
+
+            {/* Step 1: API Key */}
+            <div className={`bg-white rounded-2xl p-5 shadow-sm border mb-3 ${step===1 ? 'border-orange-200' : 'border-stone-100'}`}>
+              <div className="flex items-center gap-3 mb-3">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold ${step>=1 ? 'bg-orange-600 text-white' : 'bg-stone-100 text-stone-400'}`}>1</div>
+                <p className="font-semibold text-stone-700">Anthropic API Key <span className="text-red-400">*</span></p>
+              </div>
+              <p className="text-xs text-stone-400 mb-3 leading-relaxed">
+                Powers voice note parsing, planning & the assistant. Get one at{' '}
+                <a href="https://console.anthropic.com" target="_blank" className="text-orange-600 underline">console.anthropic.com</a>
+                {' '}→ API Keys. ~$1–3/month for household use.
+              </p>
+              <input
+                type="password"
+                placeholder="sk-ant-api03-..."
+                value={apiKey}
+                onChange={e => { setApiKey(e.target.value); setErr(''); }}
+                onFocus={() => setStep(1)}
+                className="w-full text-sm border border-stone-200 rounded-xl px-3 py-2.5"
+                style={{fontFamily:'monospace'}}
+              />
+            </div>
+
+            {/* Step 2: Firebase */}
+            <div className={`bg-white rounded-2xl p-5 shadow-sm border mb-4 ${step===2 ? 'border-orange-200' : 'border-stone-100'}`}>
+              <div className="flex items-center gap-3 mb-3">
+                <div className={`w-7 h-7 rounded-full flex items-center justify-center text-sm font-bold ${step>=2 ? 'bg-orange-600 text-white' : 'bg-stone-100 text-stone-400'}`}>2</div>
+                <p className="font-semibold text-stone-700">Firebase Config <span className="text-stone-400 font-normal text-xs">(optional – needed to share with husband)</span></p>
+              </div>
+              <div className="bg-stone-50 rounded-xl p-3 mb-3 text-xs text-stone-500 leading-relaxed space-y-1">
+                <p><span className="font-semibold">To sync tasks with your husband (free):</span></p>
+                <p>1. Go to <a href="https://console.firebase.google.com" target="_blank" className="text-orange-600 underline">console.firebase.google.com</a></p>
+                <p>2. Create project → "Hearth" → Build → Realtime Database → Create (test mode)</p>
+                <p>3. Project Settings → Your apps → Add web app → Register → copy the <code className="bg-stone-200 px-1 rounded">firebaseConfig</code> object</p>
+                <p>4. Paste it below. Both of you enter the same config.</p>
+              </div>
+              <textarea
+                rows={5}
+                placeholder={'{\n  apiKey: "...",\n  databaseURL: "https://your-project-default-rtdb.firebaseio.com",\n  projectId: "...",\n  ...\n}'}
+                value={fbRaw}
+                onChange={e => { setFbRaw(e.target.value); setErr(''); }}
+                onFocus={() => setStep(2)}
+                className="w-full text-xs border border-stone-200 rounded-xl px-3 py-2.5"
+                style={{fontFamily:'monospace', resize:'none'}}
+              />
+            </div>
+
+            {err && <p className="text-sm text-red-500 mb-3 px-1">{err}</p>}
+
+            <button onClick={finish} disabled={!apiKey.trim()}
+              className="w-full bg-orange-600 text-white font-semibold py-3.5 rounded-xl hover:bg-orange-700 disabled:opacity-50 transition-colors text-sm">
+              {fbRaw.trim() ? 'Set up with sync →' : 'Set up (single device) →'}
+            </button>
+            <p className="text-center text-xs text-stone-400 mt-3">Your API key is stored only on this device, never uploaded anywhere.</p>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Settings View ────────────────────────────────────────────────────────
+    function SettingsView({ names, setNames, rules, setRules, fbConnected, apiKey }) {
+      const opts = [
+        { val:'wife',     getL:(n)=>n.wife||'Wife',    cls:'bg-orange-600 text-white' },
+        { val:'husband',  getL:(n)=>n.husband||'Husband', cls:'bg-blue-600 text-white' },
+        { val:'together', getL:()=>'Both',             cls:'bg-green-600 text-white'  },
+        { val:null,       getL:()=>'Auto ✦',           cls:'bg-stone-700 text-white'  },
+      ];
+      return (
+        <div>
+          <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+            <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide mb-3">👤 Your Names</p>
+            {[['wife','👩 Wife\'s name','e.g. Priya'],['husband','👨 Husband\'s name','e.g. Rahul']].map(([k,lbl,ph]) => (
+              <div key={k} className="mb-2">
+                <label className="text-xs text-stone-400 mb-1 block">{lbl}</label>
+                <input className="w-full text-sm border border-stone-200 rounded-xl px-3 py-2.5" placeholder={ph}
+                  value={names[k]||''} onChange={e => setNames(n => ({...n,[k]:e.target.value}))} />
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+            <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide mb-1">📋 Category Rules</p>
+            <p className="text-xs text-stone-400 mb-3 leading-relaxed">Set a default owner — all tasks in that category auto-assign. <span className="text-stone-500 font-semibold">Auto ✦</span> = AI suggests fair split.</p>
+            {Object.entries(CATS).map(([key,cat]) => (
+              <div key={key} className="flex items-center gap-2 py-2.5 border-b border-stone-50 last:border-0">
+                <span className="text-base w-6 text-center flex-shrink-0">{cat.icon}</span>
+                <span className="flex-1 text-sm text-stone-700 font-medium">{cat.label}</span>
+                <div className="flex gap-1 flex-wrap justify-end">
+                  {opts.map(o => {
+                    const active = (rules[key]??null) === o.val;
+                    return (
+                      <button key={String(o.val)} onClick={() => setRules(r=>({...r,[key]:o.val}))}
+                        className={`text-xs px-2.5 py-1 rounded-lg font-medium transition-colors ${active ? o.cls : 'bg-stone-100 text-stone-400 hover:bg-stone-200'}`}>
+                        {o.getL(names)}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-white rounded-2xl p-4 shadow-sm border border-stone-100 text-xs text-stone-400 space-y-1">
+            <p>🔑 API key: <span className="text-stone-600 font-mono">{apiKey ? apiKey.slice(0,12)+'…' : 'not set'}</span></p>
+            <p>☁️ Sync: {fbConnected ? <span className="text-green-600 font-semibold">Firebase connected — tasks sync in real-time</span> : <span className="text-stone-400">Local only (no Firebase config)</span>}</p>
+            <button onClick={()=>{localStorage.clear();window.location.reload();}} className="text-red-400 mt-2 hover:text-red-600 transition-colors">Reset & re-setup</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Capture View ─────────────────────────────────────────────────────────
+    function CaptureView({ profile, names, rules, apiKey, isListening, live, saved, pending, setPending, processing, speechOk, txt, setTxt, onStart, onStop, onAdd, onSubmitText }) {
+      const asgn = getAsgn(names);
+      return (
+        <div>
+          <div className="flex flex-col items-center py-8 gap-4">
+            <div className="text-xs font-semibold text-stone-400 bg-white border border-stone-100 px-3 py-1 rounded-full shadow-sm">
+              Recording as <span className={profile==='wife'?'text-orange-600':'text-blue-600'}>{names[profile]||(profile==='wife'?'Wife':'Husband')}</span>
+            </div>
+            <button onClick={isListening?onStop:onStart} disabled={!speechOk&&!isListening}
+              className={isListening?'mic-pulse':''}
+              style={{width:88,height:88,borderRadius:'50%',border:'none',cursor:'pointer',fontSize:32,display:'flex',alignItems:'center',justifyContent:'center',background:isListening?'#dc2626':'#ea580c',boxShadow:isListening?'none':'0 8px 24px rgba(234,88,12,0.4)',transition:'background 0.2s'}}>
+              {isListening?'⏹️':'🎙️'}
+            </button>
+            <p className="text-sm text-stone-500 text-center leading-snug">
+              {!speechOk?'Voice not supported here — use text below':isListening?'🔴 Listening… tap to stop':'Tap to record a voice note'}
+            </p>
+          </div>
+
+          {(live||saved) && (
+            <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+              <p className="text-xs font-semibold text-stone-400 mb-1.5 uppercase tracking-wide">Your note</p>
+              <p className="text-sm text-stone-500 italic leading-relaxed">{live||saved}{isListening&&<span className="opacity-50"> ▋</span>}</p>
+            </div>
+          )}
+
+          {processing && (
+            <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100 flex items-center gap-3">
+              <Spin /> <span className="text-sm text-stone-500">Extracting tasks & applying rules…</span>
+            </div>
+          )}
+
+          {pending.length>0 && !processing && (
+            <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+              <div className="flex items-center justify-between mb-3">
+                <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide">✨ Review & confirm</p>
+                <div className="flex gap-3 text-xs text-stone-300"><span>🔒 rule</span><span>✦ AI pick</span></div>
+              </div>
+              {pending.map((t,i)=>{
+                const cat=CATS[t.category]||CATS.other, ac=asgn[t.assignee]||asgn.wife;
+                return (
+                  <div key={i} className={`py-2.5 ${i<pending.length-1?'border-b border-stone-50':''}`}>
+                    <div className="flex items-start gap-2">
+                      <span className="text-base mt-0.5 flex-shrink-0">{cat.icon}</span>
+                      <input value={t.title} onChange={e=>{const u=[...pending];u[i]={...u[i],title:e.target.value};setPending(u);}}
+                        className="flex-1 text-sm text-stone-800 bg-transparent border-none min-w-0" style={{outline:'none'}} />
+                      <div className="flex items-center gap-1 flex-shrink-0">
+                        <span className="text-xs text-stone-300">{t.ruleApplied?'🔒':'✦'}</span>
+                        <Chip tw={ac.tw}>{ac.label}</Chip>
+                      </div>
+                    </div>
+                    {!t.ruleApplied && (
+                      <div className="flex gap-1.5 mt-2 ml-7">
+                        {['wife','husband','together'].map(a => {
+                          const cfg=asgn[a];
+                          return <button key={a} onClick={()=>{const u=[...pending];u[i]={...u[i],assignee:a};setPending(u);}}
+                            className={`text-xs px-2.5 py-1 rounded-full font-semibold transition-colors ${t.assignee===a?cfg.btn+' text-white':'bg-stone-100 text-stone-400 hover:bg-stone-200'}`}>
+                            {cfg.label}
+                          </button>;
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div className="mt-4 pt-3 border-t border-stone-50">
+                <div className="flex gap-3 mb-3">
+                  {['wife','husband','together'].map(a=>{const n=pending.filter(t=>t.assignee===a).length;if(!n)return null;const cfg=asgn[a];return <span key={a} className={`text-xs font-semibold ${a==='wife'?'text-orange-600':a==='husband'?'text-blue-600':'text-green-600'}`}>{cfg.label}: {n}</span>;})}
+                </div>
+                <button onClick={onAdd} className="w-full bg-orange-600 text-white text-sm font-semibold py-3 rounded-xl hover:bg-orange-700 transition-colors">
+                  Add {pending.length} task{pending.length>1?'s':''} ✓
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="bg-white rounded-2xl p-4 shadow-sm border border-stone-100">
+            <p className="text-xs font-semibold text-stone-400 mb-2 uppercase tracking-wide">Or type a note</p>
+            <div className="flex gap-2">
+              <input className="flex-1 text-sm border border-stone-200 rounded-xl px-3 py-2.5" placeholder="Buy milk, call plumber, pay bills…"
+                value={txt} onChange={e=>setTxt(e.target.value)} onKeyDown={e=>e.key==='Enter'&&onSubmitText()} />
+              <button onClick={onSubmitText} disabled={!txt.trim()||processing}
+                className="bg-orange-600 text-white text-sm font-semibold px-4 rounded-xl hover:bg-orange-700 disabled:opacity-50 transition-colors">
+                Go
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Tasks View ───────────────────────────────────────────────────────────
+    function TasksView({ tasks, filter, setFilter, names, onToggle, onDelete }) {
+      const asgn = getAsgn(names);
+      const filtered = tasks.filter(t => filter==='done'?t.done:filter==='all'?!t.done:!t.done&&t.assignee===filter);
+      const counts = { wife:tasks.filter(t=>!t.done&&t.assignee==='wife').length, husband:tasks.filter(t=>!t.done&&t.assignee==='husband').length, together:tasks.filter(t=>!t.done&&t.assignee==='together').length, done:tasks.filter(t=>t.done).length };
+      return (
+        <div>
+          <div className="grid grid-cols-4 gap-2 mb-4">
+            {[['wife','text-orange-600'],['husband','text-blue-600'],['together','text-green-600'],['done','text-stone-400']].map(([k,c])=>(
+              <div key={k} className="bg-white rounded-xl p-3 shadow-sm border border-stone-100 text-center">
+                <div className={`text-xl font-bold ${c}`} style={{fontFamily:'Georgia,serif'}}>{counts[k]}</div>
+                <div className="text-xs text-stone-400 mt-0.5 truncate">{k==='done'?'Done':k==='together'?'Both':asgn[k]?.label}</div>
+              </div>
+            ))}
+          </div>
+          <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
+            {[['all','All'],['wife',asgn.wife.label],['husband',asgn.husband.label],['together','Both'],['done','✓ Done']].map(([id,lbl])=>(
+              <button key={id} onClick={()=>setFilter(id)}
+                className={`text-xs font-semibold px-3 py-1.5 rounded-full border whitespace-nowrap transition-colors ${filter===id?'bg-orange-600 text-white border-orange-600':'bg-white text-stone-500 border-stone-200'}`}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {filtered.length===0 ? (
+            <div className="text-center py-12 text-stone-400">
+              <div className="text-5xl mb-3">{filter==='done'?'🎉':'✨'}</div>
+              <p className="text-sm">{filter==='done'?'Nothing done yet!':'No tasks here. Head to Capture.'}</p>
+            </div>
+          ) : filtered.map(t=>{
+            const cat=CATS[t.category]||CATS.other, ac=asgn[t.assignee]||asgn.wife;
+            return (
+              <div key={t.id} className={`bg-white rounded-2xl p-4 mb-2.5 shadow-sm border border-stone-100 flex gap-3 items-start ${t.done?'opacity-50':''}`}>
+                <div onClick={()=>onToggle(t.id)} className={`mt-0.5 w-5 h-5 rounded-md border-2 flex-shrink-0 flex items-center justify-center cursor-pointer transition-colors ${t.done?'bg-green-600 border-green-600':'border-stone-300'}`}>
+                  {t.done&&<span className="text-white text-xs">✓</span>}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className={`text-sm font-medium text-stone-800 mb-1.5 ${t.done?'line-through':''}`}>{t.title}</p>
+                  <div className="flex flex-wrap gap-1.5">
+                    <Chip tw={cat.tw}>{cat.icon} {cat.label}</Chip>
+                    <Chip tw={ac.tw}>{ac.label}</Chip>
+                    {t.ruleApplied&&<span className="text-xs text-stone-300" title="Rule applied">🔒</span>}
+                    {t.priority==='high'&&<Chip tw="bg-red-100 text-red-700">↑ High</Chip>}
+                    {t.estimatedMinutes>0&&<Chip tw="bg-stone-100 text-stone-500">~{t.estimatedMinutes}m</Chip>}
+                    {t.capturedBy&&<Chip tw="bg-stone-50 text-stone-400">via {asgn[t.capturedBy]?.label||t.capturedBy}</Chip>}
+                  </div>
+                </div>
+                <button onClick={()=>onDelete(t.id)} className="text-stone-300 hover:text-red-400 text-xl leading-none transition-colors">×</button>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── Plan View ────────────────────────────────────────────────────────────
+    function PlanView({ plan, loading, names, onGenerate, pendingCount }) {
+      const asgn = getAsgn(names);
+      const border = a => ({wife:'#ea580c',husband:'#2563eb',together:'#16a34a'})[a]||'#ccc';
+      return (
+        <div>
+          <div className="flex gap-2 mb-5">
+            {[['today','📅 Plan Today',true],['week','📆 Plan Week',false]].map(([type,lbl,p])=>(
+              <button key={type} onClick={()=>onGenerate(type)} disabled={loading||pendingCount===0}
+                className={`flex-1 py-3 rounded-xl text-sm font-semibold transition-colors disabled:opacity-50 ${p?'bg-orange-600 text-white hover:bg-orange-700':'bg-green-50 text-green-700 hover:bg-green-100'}`}>
+                {lbl}
+              </button>
+            ))}
+          </div>
+          {pendingCount===0&&!plan&&(
+            <div className="text-center py-12 text-stone-400">
+              <div className="text-5xl mb-3">🌱</div>
+              <p className="text-sm leading-relaxed">Add tasks in Capture first,<br/>then generate your plan here.</p>
+            </div>
+          )}
+          {loading&&<div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100 flex items-center gap-3"><Spin/><span className="text-sm text-stone-500">Building your plan…</span></div>}
+          {plan&&!loading&&(
+            <>
+              <div className="bg-orange-600 rounded-2xl p-4 mb-4 text-white">
+                <p className="text-xs font-semibold opacity-70 uppercase tracking-wide mb-1">{plan.type==='today'?"Today's Plan":"This Week's Plan"}</p>
+                <p className="text-sm leading-relaxed opacity-95">{plan.summary}</p>
+                <div className="flex gap-4 mt-3 text-xs opacity-75">
+                  {['wife','husband','together'].map(a=>{const m=(plan.slots||[]).filter(s=>s.assignee===a).reduce((x,s)=>x+(s.minutes||0),0);return m?<span key={a}>{asgn[a].label}: ~{m}m</span>:null;})}
+                </div>
+              </div>
+              {(plan.slots||[]).map((slot,i)=>(
+                <div key={i} className="bg-white rounded-2xl p-4 mb-2.5 shadow-sm border border-stone-100" style={{borderLeft:`4px solid ${border(slot.assignee)}`}}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm font-semibold text-stone-800">{slot.label}</span>
+                    <div className="flex items-center gap-2">
+                      {slot.minutes>0&&<span className="text-xs text-stone-400">{slot.minutes}m</span>}
+                      <Chip tw={asgn[slot.assignee]?.tw||'bg-stone-100 text-stone-500'}>{asgn[slot.assignee]?.label||slot.assignee}</Chip>
+                    </div>
+                  </div>
+                  <ul className="space-y-1">{(slot.tasks||[]).map((t,j)=><li key={j} className="text-sm text-stone-500 flex items-start gap-2"><span className="text-orange-400 text-base leading-none mt-0.5">·</span>{t}</li>)}</ul>
+                  {slot.tip&&<p className="text-xs text-green-600 mt-2 italic">💡 {slot.tip}</p>}
+                </div>
+              ))}
+              <p className="text-center text-xs text-stone-400 py-2">Generated {new Date(plan.generatedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</p>
+            </>
+          )}
+        </div>
+      );
+    }
+
+    // ─── Assist View ──────────────────────────────────────────────────────────
+    function AssistView({ msgs, input, setInput, onSend, loading, endRef, names }) {
+      const starters = ['How can we make chores more fair?','Suggest a weekly routine for both of us','Help me explain mental load to my husband','What category rules should we set up?'];
+      return (
+        <div>
+          {msgs.length===0&&(
+            <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+              <p className="text-xs font-semibold text-stone-400 uppercase tracking-wide mb-1">👋 Your home assistant</p>
+              <p className="text-sm text-stone-500 leading-relaxed mb-3">I know your task list and rules. Ask me anything about managing your home together.</p>
+              <div className="flex flex-col gap-2">{starters.map((s,i)=><button key={i} onClick={()=>setInput(s)} className="text-left text-sm text-stone-600 bg-orange-50 border border-orange-100 rounded-xl px-3 py-2.5 hover:bg-orange-100 transition-colors">{s}</button>)}</div>
+            </div>
+          )}
+          {msgs.length>0&&(
+            <div className="bg-white rounded-2xl p-4 mb-3 shadow-sm border border-stone-100">
+              <div className="flex flex-col gap-2.5 overflow-y-auto" style={{maxHeight:'55vh'}}>
+                {msgs.map((m,i)=>(
+                  <div key={i} className={`max-w-xs px-3.5 py-2.5 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${m.role==='user'?'bg-orange-600 text-white self-end rounded-br-sm ml-auto':'bg-stone-50 text-stone-700 self-start rounded-bl-sm border border-stone-100'}`}>
+                    {m.content}
+                  </div>
+                ))}
+                {loading&&<div className="self-start flex gap-1 px-3.5 py-2.5 bg-stone-50 rounded-2xl rounded-bl-sm border border-stone-100">{[0,150,300].map(d=><div key={d} className="w-1.5 h-1.5 bg-stone-400 rounded-full animate-bounce" style={{animationDelay:`${d}ms`}}/>)}</div>}
+                <div ref={endRef}/>
+              </div>
+            </div>
+          )}
+          <div className="flex gap-2">
+            <input className="flex-1 text-sm border border-stone-200 rounded-xl px-3 py-2.5" placeholder="Ask about your home, tasks, or planning…"
+              value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!loading&&onSend()} />
+            <button onClick={onSend} disabled={!input.trim()||loading} className="bg-orange-600 text-white text-sm font-semibold px-4 rounded-xl hover:bg-orange-700 disabled:opacity-50 transition-colors">Send</button>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Main App ─────────────────────────────────────────────────────────────
+    function HearthApp() {
+      const [ready,   setReady]   = useState(false);
+      const [apiKey,  setApiKey]  = useState('');
+      const [fbConn,  setFbConn]  = useState(false);
+
+      const [profile, setProfile] = useState('wife');
+      const [names,   setNames]   = useState({wife:'Wife',husband:'Husband'});
+      const [rules,   setRules]   = useState({});
+      const [tasks,   setTasks]   = useState([]);
+      const [plan,    setPlan]    = useState(null);
+      const [view,    setView]    = useState('capture');
+      const [filter,  setFilter]  = useState('all');
+
+      const [isListening, setIsListening] = useState(false);
+      const [live,  setLive]    = useState('');
+      const [saved, setSaved]   = useState('');
+      const [pending, setPending] = useState([]);
+      const [processing, setProcessing] = useState(false);
+      const [txt, setTxt] = useState('');
+      const [speechOk, setSpeechOk] = useState(false);
+
+      const [planLoading, setPlanLoading] = useState(false);
+      const [chatMsgs, setChatMsgs] = useState([]);
+      const [chatInput, setChatInput] = useState('');
+      const [chatLoading, setChatLoading] = useState(false);
+
+      const recRef = useRef(null);
+      const endRef  = useRef(null);
+
+      // ── Init ──
+      useEffect(() => {
+        setSpeechOk(!!(window.SpeechRecognition || window.webkitSpeechRecognition));
+        const key = localStorage.getItem('hearth-apikey');
+        if (!key) { setReady(false); return; }
+        setApiKey(key);
+        let fbOk = false;
+        try {
+          const cfg = JSON.parse(localStorage.getItem('hearth-fbcfg') || 'null');
+          fbOk = cfg ? Store.init(cfg) : false;
+        } catch {}
+        setFbConn(fbOk);
+        setReady(true);
+      }, []);
+
+      // ── Firebase real-time listeners ──
+      useEffect(() => {
+        if (!ready) return;
+        if (fbConn) {
+          const u1 = Store.listen('tasks', v => v && setTasks(Object.values(v)));
+          const u2 = Store.listen('rules', v => v && setRules(v));
+          const u3 = Store.listen('names', v => v && setNames(v));
+          const u4 = Store.listen('plan',  v => v && setPlan(v));
+          return () => { u1(); u2(); u3(); u4(); };
+        } else {
+          // Load from localStorage on mount
+          (async () => {
+            const t = await Store.get('tasks'); if (t) setTasks(Array.isArray(t)?t:Object.values(t));
+            const r = await Store.get('rules'); if (r) setRules(r);
+            const n = await Store.get('names'); if (n) setNames(n);
+            const p = await Store.get('plan');  if (p) setPlan(p);
+          })();
+        }
+      }, [ready, fbConn]);
+
+      // ── Persist names/rules/plan when changed ──
+      useEffect(() => { if (ready) Store.set('names', names); }, [names, ready]);
+      useEffect(() => { if (ready) Store.set('rules', rules); }, [rules, ready]);
+      useEffect(() => { if (ready && plan) Store.set('plan', plan); }, [plan, ready]);
+
+      // ── Persist tasks ──
+      useEffect(() => {
+        if (!ready || tasks.length === 0) return;
+        const obj = {};
+        tasks.forEach(t => { obj[t.id.replace(/[.#$/\[\]]/g,'_')] = t; });
+        Store.set('tasks', obj);
+      }, [tasks, ready]);
+
+      useEffect(() => { endRef.current?.scrollIntoView({behavior:'smooth'}); }, [chatMsgs, chatLoading]);
+
+      const handleSetup = (key, fbCfg) => {
+        setApiKey(key);
+        let ok = false;
+        if (fbCfg) { ok = Store.init(fbCfg); }
+        setFbConn(ok);
+        setReady(true);
+      };
+
+      // ── Voice ──
+      const startListening = () => {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) return;
+        const r = new SR(); r.lang='en-US'; r.interimResults=true; r.continuous=false;
+        let final = '';
+        r.onresult = e => { let int=''; for(let i=e.resultIndex;i<e.results.length;i++){if(e.results[i].isFinal)final+=e.results[i][0].transcript;else int+=e.results[i][0].transcript;} setLive(final+int); };
+        r.onend  = () => { setIsListening(false); setLive(''); if(final.trim()){setSaved(final);processNote(final);} };
+        r.onerror= () => { setIsListening(false); setLive(''); };
+        recRef.current=r; r.start();
+        setIsListening(true); setSaved(''); setPending([]);
+      };
+
+      const processNote = async (text) => {
+        setProcessing(true); setPending([]);
+        const ruledCats = Object.entries(rules).filter(([,v])=>v).map(([k,v])=>`${k}→${v}`).join(', ');
+        try {
+          const raw = await callAI(apiKey,
+            `Extract household tasks from a note. Captured by "${names[profile]||profile}". Rules: ${ruledCats||'none'}. For uncovered categories suggest fair 50/50. Return ONLY JSON array, no markdown. Each item: {"title":string,"category":"kitchen"|"cleaning"|"groceries"|"finances"|"maintenance"|"laundry"|"selfcare"|"social"|"other","priority":"high"|"medium"|"low","assignee":"wife"|"husband"|"together","estimatedMinutes":number}`,
+            `Note: "${text}"`
+          );
+          const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
+          setPending(applyRules(Array.isArray(parsed)?parsed:[parsed], rules));
+        } catch(e) {
+          setPending(applyRules([{title:text.trim(),category:'other',priority:'medium',assignee:profile,estimatedMinutes:30}], rules));
+        }
+        setProcessing(false);
+      };
+
+      const addPending = () => {
+        const newTasks = pending.map(t => ({...t,id:`${Date.now()}-${Math.random().toString(36).slice(2)}`,done:false,capturedBy:profile,createdAt:new Date().toISOString()}));
+        setTasks(prev => [...newTasks, ...prev]);
+        setPending([]); setSaved(''); setTxt(''); setView('tasks');
+      };
+
+      const generatePlan = async (type) => {
+        setPlanLoading(true);
+        const open = tasks.filter(t=>!t.done);
+        const ruled = Object.entries(rules).filter(([,v])=>v).map(([k,v])=>`${k}:${v}`).join(', ');
+        try {
+          const raw = await callAI(apiKey,
+            `You are Hearth, a warm household planning assistant. Return ONLY valid JSON, no other text.`,
+            `Today: ${new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})}. Partners: wife="${names.wife||'Wife'}", husband="${names.husband||'Husband'}". Rules: ${ruled||'none'}. Tasks: ${JSON.stringify(open)}. Create a ${type==='today'?'realistic daily plan':'balanced weekly plan'} respecting rules, fairly splitting the rest. JSON: {"summary":"warm 1-2 sentence message","totalMinutes":number,"slots":[{"label":"${type==='today'?'Morning|Afternoon|Evening':'Monday|Tuesday|etc'}","tasks":["task title"],"assignee":"wife"|"husband"|"together","minutes":number,"tip":"optional tip"}]}`
+          );
+          const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
+          setPlan({...parsed,type,generatedAt:new Date().toISOString()});
+        } catch(e){ console.error(e); }
+        setPlanLoading(false);
+      };
+
+      const sendChat = async () => {
+        if (!chatInput.trim()||chatLoading) return;
+        const msg=chatInput; setChatInput('');
+        const next=[...chatMsgs,{role:'user',content:msg}];
+        setChatMsgs(next); setChatLoading(true);
+        const ruled=Object.entries(rules).filter(([,v])=>v).map(([k,v])=>`${k}→${v}`).join(', ');
+        try {
+          const r = await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json','x-api-key':apiKey,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+            body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,system:`You are Hearth for ${names.wife||'Wife'} & ${names.husband||'Husband'}. Rules: ${ruled||'none'}. Tasks: ${JSON.stringify(tasks.filter(t=>!t.done))}. Be warm and practical.`,messages:next})});
+          const d=await r.json();
+          setChatMsgs([...next,{role:'assistant',content:d.content[0].text}]);
+        } catch { setChatMsgs([...next,{role:'assistant',content:"Couldn't connect — check your API key in Settings."}]); }
+        setChatLoading(false);
+      };
+
+      const navItems = [{id:'capture',icon:'🎙️',label:'Capture'},{id:'tasks',icon:'✅',label:'Tasks'},{id:'plan',icon:'📅',label:'Plan'},{id:'assist',icon:'💬',label:'Assist'},{id:'settings',icon:'⚙️',label:'Settings'}];
+
+      if (!ready) return <SetupScreen onDone={handleSetup} />;
+
+      const pendingCount = tasks.filter(t=>!t.done).length;
+
+      return (
+        <div className="min-h-screen bg-orange-50" style={{maxWidth:480,margin:'0 auto',paddingBottom:84,fontFamily:'system-ui,-apple-system,sans-serif'}}>
+          <header className="sticky top-0 z-10 bg-orange-50 px-4 pt-4 pb-2 border-b border-orange-100">
+            <div className="flex items-center justify-between mb-2">
+              <h1 className="text-xl font-bold text-orange-700" style={{fontFamily:'Georgia,serif'}}>🏡 Hearth</h1>
+              <div className="flex items-center gap-2">
+                {fbConn&&<span className="w-2 h-2 rounded-full bg-green-400" title="Syncing with Firebase" />}
+                <span className="text-xs text-stone-400 bg-white px-3 py-1 rounded-full border border-stone-100">{new Date().toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric'})}</span>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              {['wife','husband'].map(p=>(
+                <button key={p} onClick={()=>setProfile(p)}
+                  className={`flex-1 text-xs font-semibold py-1.5 rounded-lg transition-colors border ${profile===p?(p==='wife'?'bg-orange-600 text-white border-orange-600':'bg-blue-600 text-white border-blue-600'):'bg-white text-stone-400 border-stone-200'}`}>
+                  {p==='wife'?'👩':'👨'} {names[p]||(p==='wife'?'Wife':'Husband')}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-stone-400 mt-1.5">{pendingCount>0?`${pendingCount} task${pendingCount>1?'s':''} pending`:'✨ All caught up!'}</p>
+          </header>
+
+          <main className="px-4 pt-4">
+            {view==='capture' && <CaptureView profile={profile} names={names} rules={rules} apiKey={apiKey} isListening={isListening} live={live} saved={saved} pending={pending} setPending={setPending} processing={processing} speechOk={speechOk} txt={txt} setTxt={setTxt} onStart={startListening} onStop={()=>recRef.current?.stop()} onAdd={addPending} onSubmitText={async()=>{if(!txt.trim())return;setSaved(txt);await processNote(txt);}} />}
+            {view==='tasks'   && <TasksView tasks={tasks} filter={filter} setFilter={setFilter} names={names} onToggle={id=>setTasks(p=>p.map(t=>t.id===id?{...t,done:!t.done}:t))} onDelete={id=>setTasks(p=>p.filter(t=>t.id!==id))} />}
+            {view==='plan'    && <PlanView plan={plan} loading={planLoading} names={names} onGenerate={generatePlan} pendingCount={pendingCount} />}
+            {view==='assist'  && <AssistView msgs={chatMsgs} input={chatInput} setInput={setChatInput} onSend={sendChat} loading={chatLoading} endRef={endRef} names={names} />}
+            {view==='settings'&& <SettingsView names={names} setNames={n=>{setNames(n);Store.set('names',n);}} rules={rules} setRules={r=>{setRules(r);Store.set('rules',r);}} fbConnected={fbConn} apiKey={apiKey} />}
+          </main>
+
+          <nav className="fixed bottom-0 left-1/2 -translate-x-1/2 w-full max-w-[480px] bg-white border-t border-stone-100 flex z-20" style={{boxShadow:'0 -4px 16px rgba(0,0,0,0.06)'}}>
+            {navItems.map(item=>(
+              <button key={item.id} onClick={()=>setView(item.id)}
+                className={`flex-1 flex flex-col items-center py-2 gap-0.5 border-none cursor-pointer transition-colors ${view===item.id?'bg-orange-50':'bg-white hover:bg-stone-50'}`}>
+                <div className={`w-9 h-9 rounded-xl flex items-center justify-center text-base ${view===item.id?'bg-orange-100':''}`}>{item.icon}</div>
+                <span className={`text-[9px] font-semibold ${view===item.id?'text-orange-600':'text-stone-400'}`}>{item.label}</span>
+              </button>
+            ))}
+          </nav>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<HearthApp />);
+  </script>
+</body>
+</html>

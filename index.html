@@ -1,9 +1,11 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
   <title>Hearth 🏡</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
@@ -33,9 +35,11 @@
 
     // ── MODEL — auto-detects first available model on this API key ──────────────
     const MODELS_TO_TRY = [
+      'claude-haiku-4-5-20251001',
+      'claude-sonnet-4-5-20251001',
       'claude-3-5-haiku-20241022',
-      'claude-3-haiku-20240307',
       'claude-3-5-sonnet-20241022',
+      'claude-3-haiku-20240307',
       'claude-3-sonnet-20240229',
     ];
     let AI_MODEL = MODELS_TO_TRY[0]; // will be updated after detection
